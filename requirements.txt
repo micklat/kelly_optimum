@@ -1,0 +1,8 @@
+scipy
+jax
+jaxlib
+pandas>=1.0.1
+odfpy
+xlrd
+toposort
+
