@@ -1,16 +1,13 @@
-#!/usr/bin/env python3.8
+#!/usr/bin/env python
 
-import jax.numpy as np
-import jax
-from jax.config import config as jax_config
+import casadi
 from attr import attrs
 from typing import List, Dict, Union, Any, Iterable, Tuple, Callable
-from scipy.optimize import minimize
 import pandas as pd
 import sys
 from toposort import toposort_flatten
 from collections import OrderedDict
-import numpy as onp
+import numpy as np
 
 """
 This module calculates growth optimal (Kelly optimal) portfolios.
@@ -21,14 +18,11 @@ Strategy:
 - define assets. Every asset maps world states to values.
 - define portfolios. Portfolios are linear combinations of assets.
 - calculate kelly criterion of portfolio
-- calculate gradient of kelly criterion using jax
+- calculate gradient of kelly criterion using ad
 
 TODO:
 - calculate sensitivity of the expected log return to numeric inputs.
 """
-
-jax_config.update("jax_enable_x64", True)
-
 
 DiscreteValue = Union[str, int, float]
 
@@ -69,32 +63,64 @@ class Asset:
 class Model:
     unknowns: Dict[str, DiscreteUnknown] # topologically ordered
     assets: List[Asset]
-    
-    
+
+
+class DS:
+    def __init__(self, *args, **kwargs):
+        self.__dict__ = {}
+        for d in args:
+            self.__dict__.update(d)
+        self.__dict__.update(kwargs)
+
+        
 @attrs(auto_attribs=True, init=False, slots=True)
 class PortfolioOptimization:
     state_probabilities: np.ndarray # [state]
     asset_values: np.ndarray  # [state, asset]
-    _minimization_objective: Callable[[onp.ndarray], float]
-    _minimization_gradient: Callable[[onp.ndarray], onp.ndarray]
+    opti: casadi.Opti
+    expressions: object
 
     def __init__(self, state_probabilities, asset_values):
         self.state_probabilities = state_probabilities
         self.asset_values = asset_values
         self.validate()
-        self._minimization_objective = lambda x: jax.jit(self._core_minimization_objective)(x).block_until_ready().item()
-        gradient = jax.jit(jax.grad(self._core_minimization_objective))
-        self._minimization_gradient = lambda x: onp.array(gradient(x).block_until_ready(), dtype=onp.float64)
-    
-    def _core_minimization_objective(self, coded_asset_weights: np.ndarray) -> float:
-        # to maximize the kelly criterion, minimize its negative
-        return -self.kelly_criterion(self.decode_weights(coded_asset_weights))
 
-    def kelly_criterion(self, asset_weights: np.ndarray) -> float:
-        cash = 1 - asset_weights.sum()
-        state_values = self.asset_values.dot(asset_weights) + cash
-        return np.log(state_values).dot(self.state_probabilities)
+        n_states = self.n_states
+        n_assets = self.n_assets
+        
+        self.opti = opti = casadi.Opti()
+        self.expressions = {}
+        p_asset_values = opti.parameter(n_states, n_assets)
+        opti.set_value(p_asset_values, asset_values)
+        p_state_probabilities = opti.parameter(n_states)
+        opti.set_value(p_state_probabilities, state_probabilities)
 
+        v_coded = opti.variable(n_assets)
+        coded_total = casadi.sum1(v_coded)
+        asset_weights = v_coded / (coded_total + 1)  # the rest is cash
+        cash = 1.0 / (coded_total + 1) # 1-sum(weights)
+        state_values = casadi.mtimes(p_asset_values, asset_weights) + cash
+        kelly_criterion = casadi.dot(casadi.log(state_values), p_state_probabilities)
+        opti.minimize(-kelly_criterion)
+        opti.subject_to(v_coded >= 0)
+        opti.set_initial(v_coded, np.ones(n_assets))
+        opti.solver('ipopt')
+
+        self.expressions = DS({
+            name: value
+            for name, value in locals().items()
+            if isinstance(value, casadi.MX)})
+
+    def solve(self, **kwargs):
+        solution = self.opti.solve()
+        e = self.expressions
+        expected_log2_of_value = solution.value(e.kelly_criterion) / np.log(2)
+        return dict(weights = np.reshape(solution.value(e.asset_weights), (self.n_assets,)),
+                    doubling = expected_log2_of_value,
+                    complete_solution = solution,
+                    expressions = e)
+
+        
     def validate(self):
         assert self.state_probabilities.shape == (self.n_states,)
         assert self.asset_values.shape == (self.n_states, self.n_assets)
@@ -109,21 +135,6 @@ class PortfolioOptimization:
     def n_states(self):
         return len(self.state_probabilities)
     
-    def solve(self, **kwargs):
-        coded_starting_point = np.ones(self.n_assets, dtype=np.float64) 
-        bounds = [(0, None) for _ in range(self.n_assets)]
-        res = minimize(self._minimization_objective, coded_starting_point, jac=self._minimization_gradient,
-                       bounds=bounds, **kwargs)
-        expected_log2_of_value = -res.fun / np.log(2)
-        return dict(weights = self.decode_weights(res.x),
-                    doubling = expected_log2_of_value,
-                    coded_result = res)                   
-
-    @staticmethod
-    def decode_weights(coded: np.ndarray):
-        normalized = coded / (coded.sum() + 1)  # the rest is cash
-        return normalized
-
 
 def load_model(cpts_path: str):
     engine = "odf" if cpts_path.endswith("ods") else None
